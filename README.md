@@ -87,6 +87,12 @@ Clash Verge Rev 的内核 (mihomo) 在本机暴露一个命名管道 RESTful API
 powershell -NoProfile -ExecutionPolicy Bypass -File ClashIsland.ps1 -Diag
 ```
 
+## 🔗 相关项目
+
+- [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) — 本工具适配的 Clash 桌面客户端（GUI）
+- [mihomo](https://github.com/MetaCubeX/mihomo)（原 Clash.Meta）— Clash Verge Rev 内置的代理内核，本工具通过它的 RESTful API 读取状态、切换节点
+- 原版 [Clash](https://github.com/Dreamacro/clash) 仓库已于 2023 年被作者移除，mihomo 是目前社区维护的主流内核
+
 ## 📄 License
 
 [MIT](LICENSE)
