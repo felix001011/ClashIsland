@@ -328,6 +328,8 @@ $script:GrayBrush   = New-Brush '#8B98AC'
 $script:HoverBrush  = New-Brush '#2BFFFFFF'
 $script:AmberBrush  = New-Brush '#FBBF24'
 $script:AccentBrush = New-Brush '#7DD3FC'
+$script:PillBgNorm  = New-Brush '#E61B2030'
+$script:RedTextBrush = New-Brush '#FECACA'
 $script:BorderNorm  = New-Brush '#2EFFFFFF'
 $script:BorderWarn  = New-Brush '#90F87171'
 
@@ -376,27 +378,50 @@ function Open-ClashVerge {
 
 # ---------- 红色呼吸警告 ----------
 $script:warnState = $false
+$script:WarnBg = $null
+
+function New-PulseAnim([double]$from, [double]$to) {
+    $a = New-Object System.Windows.Media.Animation.DoubleAnimation($from, $to, (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(900))))
+    $a.AutoReverse = $true
+    $a.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+    $a.EasingFunction = New-Object System.Windows.Media.Animation.SineEase
+    return $a
+}
+
 function Set-Warn([bool]$on) {
     if ($on -eq $script:warnState) { return }
     $script:warnState = $on
     if ($on) {
         $script:Pill.BorderBrush = $script:BorderWarn
+        # 红色光晕: 阴影变红, 亮度和扩散半径同步呼吸
         $script:Shadow.Color = [System.Windows.Media.Color]::FromRgb(0xF8, 0x71, 0x71)
-        $a = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.2, (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(750))))
-        $a.AutoReverse = $true
-        $a.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
-        $script:Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $a)
-        $a2 = New-Object System.Windows.Media.Animation.DoubleAnimation(0.45, 0.95, (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(750))))
-        $a2.AutoReverse = $true
-        $a2.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
-        $script:Shadow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $a2)
+        $script:Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, (New-PulseAnim 1.0 0.25))
+        $script:Shadow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::OpacityProperty, (New-PulseAnim 0.45 0.95))
+        $script:Shadow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::BlurRadiusProperty, (New-PulseAnim 12.0 26.0))
+        # 整岛背景在深色与暗红之间弥散渐变
+        $cFrom = [System.Windows.Media.Color][System.Windows.Media.ColorConverter]::ConvertFromString('#E61B2030')
+        $cTo   = [System.Windows.Media.Color][System.Windows.Media.ColorConverter]::ConvertFromString('#F05F1F2D')
+        $script:WarnBg = New-Object System.Windows.Media.SolidColorBrush($cFrom)
+        $script:Pill.Background = $script:WarnBg
+        $ca = New-Object System.Windows.Media.Animation.ColorAnimation($cFrom, $cTo, (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(900))))
+        $ca.AutoReverse = $true
+        $ca.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+        $ca.EasingFunction = New-Object System.Windows.Media.Animation.SineEase
+        $script:WarnBg.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $ca)
         $script:idleTimer.Stop()
         Expand-Island
     } else {
         $script:Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
         $script:Shadow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $null)
+        $script:Shadow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::BlurRadiusProperty, $null)
+        if ($script:WarnBg) {
+            $script:WarnBg.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $null)
+            $script:WarnBg = $null
+        }
+        $script:Pill.Background = $script:PillBgNorm
         $script:Dot.Opacity = 1.0
         $script:Shadow.Opacity = 0.45
+        $script:Shadow.BlurRadius = 14
         $script:Shadow.Color = [System.Windows.Media.Colors]::Black
         $script:Pill.BorderBrush = $script:BorderNorm
         $script:idleTimer.Stop()
@@ -455,11 +480,12 @@ function Collapse-Island {
     Start-TopAnim (7.0 - 12.0 - $script:Pill.ActualHeight)
 }
 
-# 鼠标离开 5 秒后自动收起
+# 鼠标离开后立即收起 (留 0.4 秒缓冲防抖; 启动时首次展示 3 秒)
 $script:idleTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:idleTimer.Interval = [TimeSpan]::FromSeconds(5)
+$script:idleTimer.Interval = [TimeSpan]::FromSeconds(3)
 $script:idleTimer.Add_Tick({
     $script:idleTimer.Stop()
+    $script:idleTimer.Interval = [TimeSpan]::FromMilliseconds(400)
     Collapse-Island
 })
 
@@ -514,7 +540,47 @@ $script:NodeScroll = New-Object System.Windows.Controls.ScrollViewer
 $script:NodeScroll.MaxHeight = 320
 $script:NodeScroll.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
 $script:NodeList = New-Object System.Windows.Controls.StackPanel
+$script:NodeList.Margin = New-Object System.Windows.Thickness(0, 0, 3, 0)
 $script:NodeScroll.Content = $script:NodeList
+
+# 极简滚动条: 6px 半透明圆角细条, 悬停/拖动时变亮
+$sbStyle = [System.Windows.Markup.XamlReader]::Parse(@'
+<Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+       TargetType="{x:Type ScrollBar}">
+  <Setter Property="Width" Value="6"/>
+  <Setter Property="MinWidth" Value="6"/>
+  <Setter Property="Background" Value="Transparent"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="{x:Type ScrollBar}">
+        <Grid Background="Transparent" Width="6">
+          <Track x:Name="PART_Track" IsDirectionReversed="True">
+            <Track.Thumb>
+              <Thumb>
+                <Thumb.Template>
+                  <ControlTemplate TargetType="{x:Type Thumb}">
+                    <Border x:Name="ThumbBar" Background="#26FFFFFF" CornerRadius="3" Margin="1,0,1,0"/>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsMouseOver" Value="True">
+                        <Setter TargetName="ThumbBar" Property="Background" Value="#55FFFFFF"/>
+                      </Trigger>
+                      <Trigger Property="IsDragging" Value="True">
+                        <Setter TargetName="ThumbBar" Property="Background" Value="#77FFFFFF"/>
+                      </Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </Thumb.Template>
+              </Thumb>
+            </Track.Thumb>
+          </Track>
+        </Grid>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+'@)
+$script:NodeScroll.Resources.Add([System.Windows.Controls.Primitives.ScrollBar], $sbStyle)
 [void]$popupStack.Children.Add($script:NodeScroll)
 
 $popupBorder.Child = $popupStack
@@ -742,10 +808,12 @@ $script:timer.Add_Tick({
     if ($s.ok) {
         if ($warn) {
             $script:Dot.Fill = $script:RedBrush
+            $script:NodeText.Foreground = $script:RedTextBrush
             $script:NodeText.Text = '网络断联'
             $script:Pill.ToolTip = "代理连通性测试失败, 当前线路可能不可用`n(悬停2秒可弹出菜单切换线路)"
         } else {
             $script:Dot.Fill = $script:GreenBrush
+            $script:NodeText.Foreground = $script:TextBrush
             $name = ''
             switch ($s.mode) {
                 'global' { $name = $s.node; if (-not $name) { $name = '全局模式' } }
@@ -761,6 +829,7 @@ $script:timer.Add_Tick({
         $script:CntText.Text  = "$($s.cnt)连"
     } else {
         $script:Dot.Fill = $script:RedBrush
+        $script:NodeText.Foreground = $script:RedTextBrush
         $script:NodeText.Text = 'Clash 未运行'
         $script:DownText.Text = '--'
         $script:UpText.Text   = '--'
