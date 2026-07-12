@@ -36,10 +36,22 @@ Add-Type -ReferencedAssemblies 'System.dll','System.Core.dll' -TypeDefinition @'
 using System;
 using System.IO;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 public static class ClashPipe
 {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool WaitNamedPipe(string name, int timeout);
+
+    // 快速探测管道是否存在, 避免 .NET Connect 在管道消失时忙等烧 CPU
+    public static void EnsurePipe(string pipeName)
+    {
+        if (!WaitNamedPipe("\\\\.\\pipe\\" + pipeName, 1))
+            throw new IOException("named pipe not available: " + pipeName);
+    }
+
     public static string Get(string pipeName, string path, string secret, int timeoutMs)
     {
         return Request(pipeName, "GET", path, secret, null, timeoutMs);
@@ -47,6 +59,7 @@ public static class ClashPipe
 
     public static string Request(string pipeName, string method, string path, string secret, string body, int timeoutMs)
     {
+        EnsurePipe(pipeName);
         byte[] bodyBytes = body == null ? new byte[0] : Encoding.UTF8.GetBytes(body);
         byte[] data;
         using (NamedPipeClientStream pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut))
@@ -123,9 +136,250 @@ public static class ClashPipe
         }
     }
 }
+
+// 后台监控: 编译型线程替代 PowerShell runspace, 大幅降低内存与 GC 压力
+public static class ClashMonitor
+{
+    private static string _pipe, _secret, _testPath, _groupPath;
+    private static volatile bool _run;
+    private static volatile bool _netTestNow, _groupTestNow;
+    private static byte[] _connBuf = new byte[262144];
+
+    public static volatile bool Ok;
+    public static volatile bool NetOk = true;
+    public static volatile int Up;
+    public static volatile int Down;
+    public static volatile int Count;
+    public static volatile string Node = "";
+    public static volatile string Mode = "";
+    public static volatile string Err = "";
+    public static volatile bool GroupTesting;
+    public static volatile string DelaysJson = "";
+    public static volatile int DelaysVer;
+
+    public static void Start(string pipeName, string secret, string testPath, string groupPath)
+    {
+        _pipe = pipeName; _secret = secret; _testPath = testPath; _groupPath = groupPath;
+        _run = true;
+        Thread t1 = new Thread(DataLoop); t1.IsBackground = true; t1.Start();
+        Thread t2 = new Thread(NetLoop);  t2.IsBackground = true; t2.Start();
+    }
+
+    public static void Stop() { _run = false; }
+    public static void RequestNetTest() { _netTestNow = true; }
+    public static void RequestGroupTest() { _groupTestNow = true; }
+
+    // ---- 线程1: /traffic 流式推送 (每秒约 30 字节) + 每 5 秒辅助信息 ----
+    private static void DataLoop()
+    {
+        while (_run)
+        {
+            try { StreamTraffic(); }
+            catch (Exception ex) { Err = ex.Message; }
+            Ok = false;
+            if (!_run) break;
+            Thread.Sleep(2500);
+        }
+    }
+
+    private static void StreamTraffic()
+    {
+        ClashPipe.EnsurePipe(_pipe);
+        using (NamedPipeClientStream pipe = new NamedPipeClientStream(".", _pipe, PipeDirection.InOut))
+        {
+            pipe.Connect(1500);
+            byte[] req = Encoding.ASCII.GetBytes("GET /traffic HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + _secret + "\r\n\r\n");
+            pipe.Write(req, 0, req.Length);
+            pipe.Flush();
+            BufferedStream bs = new BufferedStream(pipe, 8192);
+            byte[] line = new byte[1024];
+            int len = ReadLine(bs, line);
+            if (len < 12 || FindSub(line, len, " 200") < 0) throw new IOException("HTTP error on /traffic");
+            while (true) { len = ReadLine(bs, line); if (len < 0) throw new IOException("EOF in headers"); if (len <= 1) break; }
+            int tick = 0;
+            while (_run)
+            {
+                len = ReadLine(bs, line);
+                if (len < 0) throw new IOException("traffic stream closed");
+                if (len == 0 || line[0] != (byte)'{') continue;
+                long up = ScanLong(line, len, "\"up\":");
+                long down = ScanLong(line, len, "\"down\":");
+                if (up >= 0) Up = up > int.MaxValue ? int.MaxValue : (int)up;
+                if (down >= 0) Down = down > int.MaxValue ? int.MaxValue : (int)down;
+                Ok = true;
+                Err = "";
+                if (tick % 5 == 0) SideFetch();
+                tick++;
+            }
+        }
+    }
+
+    // 连接数(字节级扫描, 复用缓冲区) + 模式/节点
+    private static void SideFetch()
+    {
+        try
+        {
+            int n = FetchInto("/connections");
+            Count = CountSub(_connBuf, n, "\"id\":\"");
+            string cfg = ClashPipe.Get(_pipe, "/configs", _secret, 1500);
+            string mode = ExtractString(cfg, "\"mode\":\"");
+            if (mode != null) Mode = mode.ToLowerInvariant();
+            if (Mode == "global")
+            {
+                string g = ClashPipe.Get(_pipe, "/proxies/GLOBAL", _secret, 1500);
+                string now = ExtractString(g, "\"now\":\"");
+                if (now != null) Node = now;
+            }
+        }
+        catch { }
+    }
+
+    // ---- 线程2: 连通性测试 + 全组测速 ----
+    private static void NetLoop()
+    {
+        int failCount = 0;
+        int wait = 0;
+        while (_run)
+        {
+            if (_groupTestNow)
+            {
+                _groupTestNow = false;
+                GroupTesting = true;
+                try { DelaysJson = ClashPipe.Get(_pipe, _groupPath, _secret, 25000); DelaysVer++; }
+                catch { }
+                GroupTesting = false;
+            }
+            if (wait <= 0 || _netTestNow)
+            {
+                _netTestNow = false;
+                try
+                {
+                    ClashPipe.Get(_pipe, _testPath, _secret, 7000);
+                    failCount = 0;
+                    NetOk = true;
+                    wait = 10;
+                }
+                catch
+                {
+                    failCount++;
+                    if (failCount >= 2) NetOk = false;
+                    wait = 5;
+                }
+            }
+            Thread.Sleep(1000);
+            wait--;
+        }
+    }
+
+    // ---- 内存修剪: GC + 大对象堆压缩 + 归还工作集 ----
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")]
+    private static extern bool SetProcessWorkingSetSize(IntPtr h, IntPtr min, IntPtr max);
+
+    // 轻量修剪: 只归还工作集, 不触发 GC (适合高频调用)
+    public static void TrimWorkingSet()
+    {
+        SetProcessWorkingSetSize(GetCurrentProcess(), (IntPtr)(-1L), (IntPtr)(-1L));
+    }
+
+    public static void TrimMemory()
+    {
+        System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        SetProcessWorkingSetSize(GetCurrentProcess(), (IntPtr)(-1L), (IntPtr)(-1L));
+    }
+
+    // ---- 工具函数 (零字符串分配的字节级解析) ----
+    private static int ReadLine(Stream s, byte[] buf)
+    {
+        int i = 0;
+        while (true)
+        {
+            int b = s.ReadByte();
+            if (b < 0) return i > 0 ? i : -1;
+            if (b == 10) return i;
+            if (i < buf.Length) buf[i++] = (byte)b;
+        }
+    }
+
+    private static int FetchInto(string path)
+    {
+        ClashPipe.EnsurePipe(_pipe);
+        using (NamedPipeClientStream p = new NamedPipeClientStream(".", _pipe, PipeDirection.InOut))
+        {
+            p.Connect(1500);
+            byte[] rb = Encoding.ASCII.GetBytes("GET " + path + " HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + _secret + "\r\nConnection: close\r\n\r\n");
+            p.Write(rb, 0, rb.Length);
+            p.Flush();
+            int total = 0;
+            int n;
+            while ((n = p.Read(_connBuf, total, _connBuf.Length - total)) > 0)
+            {
+                total += n;
+                if (total == _connBuf.Length)
+                {
+                    byte[] nb = new byte[_connBuf.Length * 2];
+                    Array.Copy(_connBuf, nb, total);
+                    _connBuf = nb;
+                }
+            }
+            return total;
+        }
+    }
+
+    private static int FindSub(byte[] b, int len, string pat)
+    {
+        int m = pat.Length;
+        for (int i = 0; i + m <= len; i++)
+        {
+            bool hit = true;
+            for (int j = 0; j < m; j++) if (b[i + j] != (byte)pat[j]) { hit = false; break; }
+            if (hit) return i;
+        }
+        return -1;
+    }
+
+    private static int CountSub(byte[] b, int len, string pat)
+    {
+        int cnt = 0;
+        int m = pat.Length;
+        for (int i = 0; i + m <= len; i++)
+        {
+            bool hit = true;
+            for (int j = 0; j < m; j++) if (b[i + j] != (byte)pat[j]) { hit = false; break; }
+            if (hit) { cnt++; i += m - 1; }
+        }
+        return cnt;
+    }
+
+    private static long ScanLong(byte[] b, int len, string key)
+    {
+        int i = FindSub(b, len, key);
+        if (i < 0) return -1;
+        i += key.Length;
+        long v = 0;
+        bool any = false;
+        while (i < len && b[i] >= (byte)'0' && b[i] <= (byte)'9') { v = v * 10 + (b[i] - (byte)'0'); i++; any = true; }
+        return any ? v : -1;
+    }
+
+    private static string ExtractString(string s, string key)
+    {
+        int i = s.IndexOf(key);
+        if (i < 0) return null;
+        i += key.Length;
+        int j = s.IndexOf('"', i);
+        if (j < 0) return null;
+        return s.Substring(i, j - i);
+    }
+}
 '@
 
 $TestUrlPath = '/proxies/GLOBAL/delay?timeout=4000&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204'
+$GroupTestPath = '/group/GLOBAL/delay?timeout=3000&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204'
 
 # ---------- 诊断模式 ----------
 if ($Diag) {
@@ -147,6 +401,11 @@ if ($Diag) {
     } catch {
         Write-Output "连通性测试失败: $($_.Exception.Message)"
     }
+    Write-Output "启动后台监控线程测试 (7秒)..."
+    [ClashMonitor]::Start($pipeName, $secret, $TestUrlPath, $GroupTestPath)
+    Start-Sleep -Seconds 7
+    Write-Output ("Monitor: ok=" + [ClashMonitor]::Ok + " net=" + [ClashMonitor]::NetOk + " up=" + [ClashMonitor]::Up + " down=" + [ClashMonitor]::Down + " cnt=" + [ClashMonitor]::Count + " mode=" + [ClashMonitor]::Mode + " node=" + [ClashMonitor]::Node + " err=" + [ClashMonitor]::Err)
+    [ClashMonitor]::Stop()
     exit 0
 }
 
@@ -165,115 +424,9 @@ Add-Type -AssemblyName System.Web.Extensions
 $script:Json = New-Object System.Web.Script.Serialization.JavaScriptSerializer
 $script:Json.MaxJsonLength = 33554432
 
-# ---------- 后台数据线程共享状态 ----------
-$script:sync = [hashtable]::Synchronized(@{
-    run = $true; ok = $false; err = ''
-    net = $true; testNow = $false
-    down = 0.0; up = 0.0; cnt = 0
-    node = ''; mode = ''
-    pipe = $pipeName; secret = $secret
-    testPath = $TestUrlPath
-    delays = $null; delaysVer = 0
-    groupTestNow = $false; groupTesting = $false
-    groupTestPath = '/group/GLOBAL/delay?timeout=3000&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204'
-})
-
-# 线程1: 每秒读取流量统计 / 节点 / 模式
-$workerCode = {
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $lastDown = -1.0; $lastUp = -1.0; $lastT = 0.0
-    $tick = 0
-    while ($sync.run) {
-        try {
-            $json = [ClashPipe]::Get($sync.pipe, '/connections', $sync.secret, 1500)
-            $mD = [regex]::Match($json, '"downloadTotal":(\d+)')
-            $mU = [regex]::Match($json, '"uploadTotal":(\d+)')
-            if ($mD.Success -and $mU.Success) {
-                $down = [double]$mD.Groups[1].Value
-                $up   = [double]$mU.Groups[1].Value
-                $t = $sw.Elapsed.TotalSeconds
-                if ($lastDown -ge 0 -and $t -gt $lastT) {
-                    $dt = $t - $lastT
-                    $sync.down = [Math]::Max(0, ($down - $lastDown) / $dt)
-                    $sync.up   = [Math]::Max(0, ($up   - $lastUp)   / $dt)
-                }
-                $lastDown = $down; $lastUp = $up; $lastT = $t
-            }
-            $sync.cnt = ([regex]::Matches($json, '"id":"')).Count
-            if ($tick % 5 -eq 0) {
-                $cfg = [ClashPipe]::Get($sync.pipe, '/configs', $sync.secret, 1500) | ConvertFrom-Json
-                $sync.mode = "$($cfg.mode)".ToLower()
-                if ($sync.mode -eq 'global') {
-                    $g = [ClashPipe]::Get($sync.pipe, '/proxies/GLOBAL', $sync.secret, 1500) | ConvertFrom-Json
-                    $name = "$($g.now)" -replace '[\uD83C][\uDDE6-\uDDFF]', ''
-                    $sync.node = $name.Trim()
-                }
-            }
-            $sync.ok = $true
-        } catch {
-            $sync.ok = $false
-            $sync.err = $_.Exception.Message
-            $lastDown = -1.0
-            Start-Sleep -Milliseconds 1000
-        }
-        $tick++
-        Start-Sleep -Milliseconds 1000
-    }
-}
-
-# 线程2: 定时做真实连通性测试 (通过当前节点访问 gstatic), 连续2次失败判定断网
-$connCode = {
-    $failCount = 0
-    $wait = 0
-    while ($sync.run) {
-        if ($sync.groupTestNow) {
-            $sync.groupTestNow = $false
-            $sync.groupTesting = $true
-            try {
-                $resp = [ClashPipe]::Get($sync.pipe, $sync.groupTestPath, $sync.secret, 25000)
-                $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-                $js.MaxJsonLength = 33554432
-                $d = $js.DeserializeObject($resp)
-                $ht = @{}
-                foreach ($k in $d.Keys) { $ht[$k] = [int]$d[$k] }
-                $sync.delays = $ht
-                $sync.delaysVer = [int]$sync.delaysVer + 1
-            } catch {}
-            $sync.groupTesting = $false
-        }
-        if ($wait -le 0 -or $sync.testNow) {
-            $sync.testNow = $false
-            try {
-                [void][ClashPipe]::Get($sync.pipe, $sync.testPath, $sync.secret, 7000)
-                $failCount = 0
-                $sync.net = $true
-                $wait = 10
-            } catch {
-                $failCount++
-                if ($failCount -ge 2) { $sync.net = $false }
-                $wait = 5
-            }
-        }
-        Start-Sleep -Milliseconds 1000
-        $wait--
-    }
-}
-
-$script:rs = [runspacefactory]::CreateRunspace()
-$script:rs.Open()
-$script:rs.SessionStateProxy.SetVariable('sync', $script:sync)
-$script:psWorker = [powershell]::Create()
-$script:psWorker.Runspace = $script:rs
-[void]$script:psWorker.AddScript($workerCode.ToString())
-[void]$script:psWorker.BeginInvoke()
-
-$script:rs2 = [runspacefactory]::CreateRunspace()
-$script:rs2.Open()
-$script:rs2.SessionStateProxy.SetVariable('sync', $script:sync)
-$script:psConn = [powershell]::Create()
-$script:psConn.Runspace = $script:rs2
-[void]$script:psConn.AddScript($connCode.ToString())
-[void]$script:psConn.BeginInvoke()
+# ---------- 启动 C# 后台监控线程 (无 PowerShell runspace, 低内存) ----------
+$script:cfg = @{ pipe = $pipeName; secret = $secret }
+[ClashMonitor]::Start($pipeName, $secret, $TestUrlPath, $GroupTestPath)
 
 # ---------- 界面 ----------
 $xaml = @'
@@ -435,6 +588,9 @@ $script:delaysShown   = 0
 $script:lastGroupTest = [DateTime]::MinValue
 $script:coreDownSince = $null
 $script:hiddenByCore  = $false
+$script:lastNodeRaw      = ''
+$script:lastNodeStripped = ''
+$script:memTick          = 280
 $script:restTop   = 8.0
 $script:peekMode  = $true
 $script:collapsed = $false
@@ -529,9 +685,9 @@ $script:SpeedBtn.FontFamily = New-Object System.Windows.Media.FontFamily('Micros
 $script:SpeedBtn.Cursor = [System.Windows.Input.Cursors]::Hand
 [System.Windows.Controls.DockPanel]::SetDock($script:SpeedBtn, [System.Windows.Controls.Dock]::Right)
 $script:SpeedBtn.Add_MouseLeftButtonUp({
-    if (-not $script:sync.groupTesting) {
+    if (-not [ClashMonitor]::GroupTesting) {
         $script:lastGroupTest = Get-Date
-        $script:sync.groupTestNow = $true
+        [ClashMonitor]::RequestGroupTest()
     }
 })
 [void]$popupHeader.Children.Add($script:SpeedBtn)
@@ -594,10 +750,10 @@ $script:onRowClick = {
     $name = [string]$s.Tag
     try {
         $body = '{"name":' + (ConvertTo-Json $name) + '}'
-        [void][ClashPipe]::Request($script:sync.pipe, 'PUT', '/proxies/GLOBAL', $script:sync.secret, $body, 2500)
-        $script:sync.node = ($name -replace '[\uD83C][\uDDE6-\uDDFF]', '').Trim()
-        $script:sync.testNow = $true
-        $script:NodeText.Text = $script:sync.node
+        [void][ClashPipe]::Request($script:cfg.pipe, 'PUT', '/proxies/GLOBAL', $script:cfg.secret, $body, 2500)
+        [ClashMonitor]::Node = $name
+        [ClashMonitor]::RequestNetTest()
+        $script:NodeText.Text = ($name -replace '[\uD83C][\uDDE6-\uDDFF]', '').Trim()
         Log "切换节点: $name"
     } catch {
         Log "切换节点失败: $($_.Exception.Message)"
@@ -609,13 +765,13 @@ $script:onRowLeave = { param($s, $e) $s.Background = [System.Windows.Media.Brush
 
 function Open-NodeMenu {
     if ($script:NodePopup.IsOpen) { return }
-    if (-not $script:sync.ok) { return }
+    if (-not [ClashMonitor]::Ok) { return }
     $groupTypes = @('Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Relay', 'Direct', 'Reject', 'RejectDrop', 'Pass', 'Compatible', 'DNS')
     try {
-        $g = $script:Json.DeserializeObject([ClashPipe]::Get($script:sync.pipe, '/proxies/GLOBAL', $script:sync.secret, 2500))
+        $g = $script:Json.DeserializeObject([ClashPipe]::Get($script:cfg.pipe, '/proxies/GLOBAL', $script:cfg.secret, 2500))
         $all = @($g['all'])
         $now = [string]$g['now']
-        $p = $script:Json.DeserializeObject([ClashPipe]::Get($script:sync.pipe, '/proxies', $script:sync.secret, 4000))
+        $p = $script:Json.DeserializeObject([ClashPipe]::Get($script:cfg.pipe, '/proxies', $script:cfg.secret, 4000))
         $proxies = $p['proxies']
     } catch {
         Log "节点菜单加载失败: $($_.Exception.Message)"
@@ -688,7 +844,7 @@ function Open-NodeMenu {
     $script:closeTimer.Start()
     if (((Get-Date) - $script:lastGroupTest).TotalSeconds -gt 120) {
         $script:lastGroupTest = Get-Date
-        $script:sync.groupTestNow = $true
+        [ClashMonitor]::RequestGroupTest()
     }
     $script:window.Dispatcher.BeginInvoke(
         [action] { if ($script:curRow) { $script:curRow.BringIntoView() } },
@@ -809,9 +965,10 @@ $miExit.Add_Click({
 $script:timer = New-Object System.Windows.Threading.DispatcherTimer
 $script:timer.Interval = [TimeSpan]::FromMilliseconds(1000)
 $script:timer.Add_Tick({
-    $s = $script:sync
+    $ok = [ClashMonitor]::Ok
+    $net = [ClashMonitor]::NetOk
     # 跟随 Clash 客户端: 关闭超过 8 秒自动隐身, 重新打开自动现身
-    if ($s.ok) {
+    if ($ok) {
         $script:coreDownSince = $null
         if ($script:hiddenByCore) {
             $script:hiddenByCore = $false
@@ -833,11 +990,32 @@ $script:timer.Add_Tick({
             $script:animTimer.Stop()
             $script:window.Hide()
             Log 'Clash 已关闭, 悬浮岛隐身等待'
+            [ClashMonitor]::TrimMemory()
         }
         if ($script:hiddenByCore) { return }
     }
-    $warn = (-not $s.ok) -or (-not $s.net)
+    $warn = (-not $ok) -or (-not $net)
     Set-Warn $warn
+    # 收起状态下界面不可见: 跳过全部刷新, 每分钟轻量归还工作集, 保持内存冷却
+    if ($script:collapsed -and -not $warn -and -not $script:Pill.IsMouseOver) {
+        $script:memTick++
+        if ($script:memTick -ge 300) { $script:memTick = 0; [ClashMonitor]::TrimMemory() }
+        elseif ($script:memTick % 60 -eq 0) { [ClashMonitor]::TrimWorkingSet() }
+        return
+    }
+    # 可见时才构建完整状态快照并刷新界面
+    $s = @{
+        ok = $ok; net = $net
+        down = [double][ClashMonitor]::Down; up = [double][ClashMonitor]::Up
+        cnt = [ClashMonitor]::Count; err = [ClashMonitor]::Err
+        mode = [ClashMonitor]::Mode; groupTesting = [ClashMonitor]::GroupTesting
+        delaysVer = [ClashMonitor]::DelaysVer
+    }
+    if ([ClashMonitor]::Node -cne $script:lastNodeRaw) {
+        $script:lastNodeRaw = [ClashMonitor]::Node
+        $script:lastNodeStripped = ($script:lastNodeRaw -replace '[\uD83C][\uDDE6-\uDDFF]', '').Trim()
+    }
+    $s.node = $script:lastNodeStripped
     if ($s.ok) {
         if ($warn) {
             $script:Dot.Fill = $script:RedBrush
@@ -880,7 +1058,8 @@ $script:timer.Add_Tick({
     }
     if ($script:NodePopup.IsOpen -and $s.delaysVer -ne $script:delaysShown) {
         $script:delaysShown = $s.delaysVer
-        $d = $s.delays
+        $d = $null
+        try { $d = $script:Json.DeserializeObject([ClashMonitor]::DelaysJson) } catch {}
         if ($d) {
             foreach ($name in @($script:rowDelayMap.Keys)) {
                 $tb = $script:rowDelayMap[$name]
@@ -895,6 +1074,12 @@ $script:timer.Add_Tick({
             }
         }
     }
+    # 每 5 分钟 GC + 大对象堆压缩 + 工作集修剪, 长期驻留不吃内存
+    $script:memTick++
+    if ($script:memTick -ge 300) {
+        $script:memTick = 0
+        [ClashMonitor]::TrimMemory()
+    }
 })
 $script:timer.Start()
 
@@ -905,7 +1090,7 @@ $script:window.Add_Closed({
     $script:idleTimer.Stop()
     $script:animTimer.Stop()
     $script:NodePopup.IsOpen = $false
-    $script:sync.run = $false
+    [ClashMonitor]::Stop()
     Save-State
     Log '窗口关闭'
     if ($script:app) { $script:app.Shutdown() }
@@ -921,11 +1106,7 @@ $script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
 } catch {
     Log "FATAL: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
-    try { $script:sync.run = $false } catch {}
-    try { $script:psWorker.Stop() } catch {}
-    try { $script:psConn.Stop() } catch {}
-    try { $script:rs.Close(); $script:rs.Dispose() } catch {}
-    try { $script:rs2.Close(); $script:rs2.Dispose() } catch {}
+    try { [ClashMonitor]::Stop() } catch {}
     try { $script:Mutex.ReleaseMutex() } catch {}
     Log '退出'
 }

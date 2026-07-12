@@ -8,7 +8,7 @@
 ● 英国 03  |  ↓ 1.2 MB/s  ↑ 56 KB/s  44连
 ```
 
-**零依赖、零安装**——纯 PowerShell + WPF 实现，Windows 10/11 自带运行环境，下载即用。
+**零依赖、零安装、极低内存**——纯 PowerShell + WPF 实现，Windows 10/11 自带运行环境，下载即用；后台常驻内存仅 **10~15 MB**。
 
 ## ✨ 功能
 
@@ -62,7 +62,7 @@ Clash Verge Rev 的内核 (mihomo) 在本机暴露一个命名管道 RESTful API
 
 管道名和 API 密钥从 Clash Verge 的运行时配置 (`%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\clash-verge.yaml`) 自动读取，无需手动配置。
 
-界面为 WPF 无边框置顶窗口，数据采集在两个后台 runspace 线程中进行，不阻塞 UI。
+界面为 WPF 无边框置顶窗口。数据采集在编译型 C# 后台线程中进行（启动时即时编译）：速度来自 mihomo 的 `/traffic` 流式推送（每秒约 30 字节），连接数每 5 秒用复用缓冲区做字节级扫描，全程几乎零堆分配。收起隐藏时跳过界面刷新并定期归还工作集，长期驻留内存稳定在 **10~15 MB**。
 
 ## 📁 文件说明
 
