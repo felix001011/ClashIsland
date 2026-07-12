@@ -433,6 +433,8 @@ function Set-Warn([bool]$on) {
 $script:rowDelayMap   = @{}
 $script:delaysShown   = 0
 $script:lastGroupTest = [DateTime]::MinValue
+$script:coreDownSince = $null
+$script:hiddenByCore  = $false
 $script:restTop   = 8.0
 $script:peekMode  = $true
 $script:collapsed = $false
@@ -803,6 +805,32 @@ $script:timer = New-Object System.Windows.Threading.DispatcherTimer
 $script:timer.Interval = [TimeSpan]::FromMilliseconds(1000)
 $script:timer.Add_Tick({
     $s = $script:sync
+    # 跟随 Clash 客户端: 关闭超过 8 秒自动隐身, 重新打开自动现身
+    if ($s.ok) {
+        $script:coreDownSince = $null
+        if ($script:hiddenByCore) {
+            $script:hiddenByCore = $false
+            $script:collapsed = $false
+            $script:window.Top = $script:restTop
+            $script:window.Show()
+            $script:idleTimer.Stop()
+            $script:idleTimer.Interval = [TimeSpan]::FromSeconds(3)
+            $script:idleTimer.Start()
+            Log 'Clash 已回来, 悬浮岛现身'
+        }
+    } else {
+        if (-not $script:coreDownSince) { $script:coreDownSince = Get-Date }
+        if (-not $script:hiddenByCore -and ((Get-Date) - $script:coreDownSince).TotalSeconds -gt 8) {
+            $script:hiddenByCore = $true
+            $script:NodePopup.IsOpen = $false
+            Set-Warn $false
+            $script:idleTimer.Stop()
+            $script:animTimer.Stop()
+            $script:window.Hide()
+            Log 'Clash 已关闭, 悬浮岛隐身等待'
+        }
+        if ($script:hiddenByCore) { return }
+    }
     $warn = (-not $s.ok) -or (-not $s.net)
     Set-Warn $warn
     if ($s.ok) {
@@ -877,7 +905,9 @@ $script:window.Add_Closed({
 })
 
 Log 'UI 显示'
-[void]$script:window.ShowDialog()
+$script:app = New-Object System.Windows.Application
+$script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnMainWindowClose
+[void]$script:app.Run($script:window)
 
 } catch {
     Log "FATAL: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
