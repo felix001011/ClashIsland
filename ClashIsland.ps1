@@ -798,7 +798,12 @@ $miReset.Add_Click({
     Update-PeekMode
     Save-State
 })
-$miExit.Add_Click({ $script:window.Close() })
+$miExit.Add_Click({
+    # 手动退出标记: 看门狗在本次 Clash 会话内不再拉起悬浮岛
+    try { Set-Content -Path (Join-Path $script:Dir '.manual-exit') -Value 'user exited' -Encoding ASCII } catch {}
+    Log '用户手动退出'
+    $script:window.Close()
+})
 
 # ---------- 每秒刷新界面 ----------
 $script:timer = New-Object System.Windows.Threading.DispatcherTimer
@@ -902,11 +907,15 @@ $script:window.Add_Closed({
     $script:NodePopup.IsOpen = $false
     $script:sync.run = $false
     Save-State
+    Log '窗口关闭'
+    if ($script:app) { $script:app.Shutdown() }
 })
 
 Log 'UI 显示'
+# OnExplicitShutdown: 隐身(Hide)绝不会结束消息循环, 只有窗口 Closed 事件里的
+# Shutdown() 才能退出程序
 $script:app = New-Object System.Windows.Application
-$script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnMainWindowClose
+$script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
 [void]$script:app.Run($script:window)
 
 } catch {

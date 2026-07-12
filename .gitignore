@@ -1,6 +1,7 @@
 # 运行时自动生成的文件
 state.json
 ClashIsland.log
+.manual-exit
 
 # 本机专用的旧启动器转发 (不属于项目)
 启动悬浮岛.vbs
